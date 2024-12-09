@@ -94,7 +94,7 @@ def create_dynamic_tools(vector_results: List[Dict]) -> List[Dict]:
 
 
 def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Dict]) -> Dict:
-    """Process query using strict tag-only matching"""
+    """Process query using semantic intent matching"""
     dynamic_tools = create_dynamic_tools(vector_results)
     
     message = anthropic.messages.create(
@@ -104,7 +104,7 @@ def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Di
         tools=dynamic_tools,
         messages=[{
             "role": "user",
-            "content": f"""You are a strict query matcher that ONLY looks at tags. Your job is to ensure the user's query contains EXACTLY the words in the tags, nothing more or less.
+            "content": f"""You are a query intent analyzer. Your task is to understand the user's intent while preserving exact meaning.
 
             User query: "{user_query}"
             
@@ -116,26 +116,28 @@ def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Di
                 'module': result.payload.get('module', '')
             } for result in vector_results]}
             
-            Strict Tag Matching Rules:
-            1. Extract words from user query
-            2. Remove ONLY these allowed prefixes if present: "show", "get", "display"
-            3. The remaining words must match the tags EXACTLY:
-               - Same number of words as tags
-               - Same words as tags (order doesn't matter)
-               - NO extra words allowed
-               - NO missing words allowed
-               - ANY additional word = no match
-            
-            Example with tags ["workflow", "mailer", "status"]:
-            - "workflow mailer status" → MATCH (exact tags)
-            - "show workflow mailer status" → MATCH (allowed prefix + exact tags)
-            - "inactive workflow mailer status" → NO MATCH (extra word)
-            - "temp tablespace usage" → NO MATCH (extra word)
-            - "workflow status" → NO MATCH (missing word)
-            
+            Intent Analysis:
+            1. Look at each query's description and tags to understand what information it provides
+            2. Analyze the user's query to understand what they're asking for
+            3. Check if they're requesting EXACTLY the same information, considering:
+               - Natural language variations ("what is the status of X" = "X status")
+               - Question forms ("give me X" = "X")
+               - Polite forms ("can you show me X" = "X")
+               
+            BUT, strictly reject if:
+               - They specify a state (inactive, running, failed, etc.)
+               - They add conditions or qualifiers (temp, specific, etc.)
+               - They ask for a subset or variation of the information
+               
             Use tool calling to indicate match:
-            - should_return_query: true ONLY if remaining words = tags exactly
+            - should_return_query: true if semantic intent matches exactly
             - matched_header: header of matching query
+
+            Think step by step:
+            1. What information does the stored query provide?
+            2. What information is the user asking for?
+            3. Are they exactly the same in meaning (ignoring natural language variation)?
+            4. Are there any modifiers that change the meaning?
             """
         }]
     )
@@ -152,21 +154,13 @@ def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Di
                 if should_return_query:
                     for result in vector_results:
                         if result.payload.get('header') == matched_header:
-                            # Double-check tag matching
-                            query_words = set(user_query.lower().split())
-                            # Remove allowed prefixes if present
-                            if any(prefix in query_words for prefix in {'show', 'get', 'display'}):
-                                query_words.remove(next(word for word in query_words if word in {'show', 'get', 'display'}))
-                            tags = set(tag.lower() for tag in result.payload.get('tags', []))
-                            
-                            if query_words == tags:  # Strict equality check
-                                sql_query = result.payload.get('query')
-                                module = result.payload.get('module')
-                                if module:
-                                    response = f"Here is the SQL query from {module}:"
-                                else:
-                                    response = "Here is the SQL query:"
-                                break
+                            sql_query = result.payload.get('query')
+                            module = result.payload.get('module')
+                            if module:
+                                response = f"Here is the SQL query from {module}:"
+                            else:
+                                response = "Here is the SQL query:"
+                            break
     
     return {
         'sql_query': sql_query,
