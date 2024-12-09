@@ -1,0 +1,221 @@
+import streamlit as st
+import torch
+from transformers import AutoTokenizer, AutoModel
+from qdrant_client import QdrantClient
+from anthropic import Anthropic
+import yaml
+import os
+from typing import Dict, Optional, List
+import json
+import numpy as np  
+
+def load_config():
+    """Load configuration from YAML file"""
+    with open('config.yaml', 'r') as file:
+        return yaml.safe_load(file)
+
+@st.cache_resource
+def initialize_models():
+    """Initialize all required models and clients"""
+    config = load_config()
+    
+    # Initialize BGE model
+    tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en")
+    model = AutoModel.from_pretrained("BAAI/bge-small-en")
+    
+    # Initialize Qdrant client
+    qdrant_client = QdrantClient(
+        host=config['qdrant']['host'],
+        port=config['qdrant']['port']
+    )
+    
+    # Initialize Anthropic client
+    anthropic = Anthropic(api_key=config['anthropic']['api_key'])
+    
+    return tokenizer, model, qdrant_client, anthropic, config
+
+def generate_embeddings(text: str, tokenizer, model) -> np.ndarray:
+    """Generate embeddings for input text"""
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs).last_hidden_state.mean(dim=1)
+    return outputs.numpy().flatten()
+
+def get_vector_search_results(query_text: str, tokenizer, model, qdrant_client) -> List[Dict]:
+    """Search vector database for similar queries"""
+    query_embedding = generate_embeddings(query_text, tokenizer, model)
+    
+    results = qdrant_client.search(
+        collection_name="queries_vectorization",
+        query_vector=query_embedding.tolist(),
+        limit=3,
+        score_threshold=0.7  # Lowered threshold
+    )
+    
+    # Debug print
+    print("\nVector Search Results:")
+    for r in results:
+        print(f"\nScore: {r.score}")
+        print(f"Payload: {r.payload}")
+    
+    return results
+
+def create_dynamic_tools(vector_results: List[Dict]) -> List[Dict]:
+    """Create tool definitions dynamically based on vector search results"""
+    tools = []
+    
+    for result in vector_results:
+        payload = result.payload
+        header = payload.get('header', '')
+        description = payload.get('description', '')
+        metadata = payload.get('metadata', {})
+        tags = metadata.get('tags', [])
+        
+        tools.append({
+            "name": f"get_{header}",
+            "description": f"Get SQL query for: {description}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "should_return_query": {
+                        "type": "boolean",
+                        "description": "Whether to return the SQL query based on matching rules"
+                    },
+                    "matched_header": {
+                        "type": "string",
+                        "description": "The header of the matched query if found"
+                    }
+                },
+                "required": ["should_return_query", "matched_header"]
+            }
+        })
+    
+    return tools
+
+
+def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Dict]) -> Dict:
+    """Process query using strict tag-only matching"""
+    dynamic_tools = create_dynamic_tools(vector_results)
+    
+    message = anthropic.messages.create(
+        model="claude-3-sonnet-20240229",
+        max_tokens=1000,
+        temperature=0,
+        tools=dynamic_tools,
+        messages=[{
+            "role": "user",
+            "content": f"""You are a strict query matcher that ONLY looks at tags. Your job is to ensure the user's query contains EXACTLY the words in the tags, nothing more or less.
+
+            User query: "{user_query}"
+            
+            Available queries metadata:
+            {[{
+                'header': result.payload.get('header'),
+                'description': result.payload.get('description'),
+                'tags': result.payload.get('tags', []),
+                'module': result.payload.get('module', '')
+            } for result in vector_results]}
+            
+            Strict Tag Matching Rules:
+            1. Extract words from user query
+            2. Remove ONLY these allowed prefixes if present: "show", "get", "display"
+            3. The remaining words must match the tags EXACTLY:
+               - Same number of words as tags
+               - Same words as tags (order doesn't matter)
+               - NO extra words allowed
+               - NO missing words allowed
+               - ANY additional word = no match
+            
+            Example with tags ["workflow", "mailer", "status"]:
+            - "workflow mailer status" → MATCH (exact tags)
+            - "show workflow mailer status" → MATCH (allowed prefix + exact tags)
+            - "inactive workflow mailer status" → NO MATCH (extra word)
+            - "temp tablespace usage" → NO MATCH (extra word)
+            - "workflow status" → NO MATCH (missing word)
+            
+            Use tool calling to indicate match:
+            - should_return_query: true ONLY if remaining words = tags exactly
+            - matched_header: header of matching query
+            """
+        }]
+    )
+
+    sql_query = None
+    response = "Please contact your system administrator."
+    
+    if hasattr(message, 'content') and isinstance(message.content, list):
+        for block in message.content:
+            if hasattr(block, 'input'):
+                should_return_query = block.input.get('should_return_query', False)
+                matched_header = block.input.get('matched_header', '')
+                
+                if should_return_query:
+                    for result in vector_results:
+                        if result.payload.get('header') == matched_header:
+                            # Double-check tag matching
+                            query_words = set(user_query.lower().split())
+                            # Remove allowed prefixes if present
+                            if any(prefix in query_words for prefix in {'show', 'get', 'display'}):
+                                query_words.remove(next(word for word in query_words if word in {'show', 'get', 'display'}))
+                            tags = set(tag.lower() for tag in result.payload.get('tags', []))
+                            
+                            if query_words == tags:  # Strict equality check
+                                sql_query = result.payload.get('query')
+                                module = result.payload.get('module')
+                                if module:
+                                    response = f"Here is the SQL query from {module}:"
+                                else:
+                                    response = "Here is the SQL query:"
+                                break
+    
+    return {
+        'sql_query': sql_query,
+        'response': response
+    }
+
+def main():
+    """Main Streamlit application"""
+    st.title("SQL Query Assistant")
+    
+    try:
+        # Initialize models and clients
+        tokenizer, model, qdrant_client, anthropic, config = initialize_models()
+        
+        # Initialize session state
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        
+        # Display chat history
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        # Handle user input
+        if prompt := st.chat_input("Ask about an SQL query"):
+            # Add user message to chat
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Get vector search results
+            vector_results = get_vector_search_results(prompt, tokenizer, model, qdrant_client)
+            
+            # Process query using metadata matching
+            result = process_query(anthropic, prompt, vector_results)
+            
+            # Display response
+            with st.chat_message("assistant"):
+                if result['sql_query']:
+                    st.markdown(f"```sql\n{result['sql_query']}\n```")
+                else:
+                    st.markdown(result['response'])
+                
+                # Add assistant response to chat history
+                full_response = f"{result['sql_query']}\n\n{result['response']}" if result['sql_query'] else result['response']
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
