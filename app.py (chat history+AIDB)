@@ -1,0 +1,373 @@
+import streamlit as st
+import torch
+from transformers import AutoTokenizer, AutoModel
+from qdrant_client import QdrantClient
+from anthropic import Anthropic
+import yaml
+import os
+from typing import Dict, Optional, List
+import json
+import numpy as np  
+import pickle
+from datetime import datetime
+
+# Define just the core features without variations
+CORE_FEATURES = ['fetch log file', 'fetch or download out file', 'ldt file download', 'bounce database', 'create user', 'add data files', 'session locks', 'inactive user sessions', 'concurrent programs',
+    'advanced query lookup', 'log4j vulnerabilities', 'alert logs', 'long-running queries']
+
+def check_feature_match(query: str) -> bool:
+    """
+    Smart feature matching that detects variations of the core features
+    """
+    query = query.lower().strip()
+    query_words = set(query.split())
+    
+    for feature in CORE_FEATURES:
+        # Get the essential keywords from the feature
+        feature_words = set(feature.lower().split())
+        
+        # Check if any two words from the feature appear in the query
+        # This makes the matching more flexible while maintaining accuracy
+        matching_words = feature_words.intersection(query_words)
+        
+        # For features with 3 or more words, require at least 2 matching words
+        # For features with 2 words, require at least 1 matching word
+        min_required_matches = 2 if len(feature_words) >= 3 else 1
+        
+        if len(matching_words) >= min_required_matches:
+            # Additional check for single-word matches to avoid false positives
+            if len(matching_words) == 1:
+                word = matching_words.pop()
+                # For single word matches, require exact word match
+                if any(word == q_word for q_word in query_words):
+                    return True
+            else:
+                return True
+    
+    return False
+
+def load_chat_history():
+    """Load chat history from pickle file"""
+    try:
+        with open('chat_history.pkl', 'rb') as f:
+            return pickle.load(f)
+    except FileNotFoundError:
+        return {}
+
+def save_chat_history(history):
+    """Save chat history to pickle file"""
+    with open('chat_history.pkl', 'wb') as f:
+        pickle.dump(history, f)
+
+def load_config():
+    """Load configuration from YAML file"""
+    with open('config.yaml', 'r') as file:
+        return yaml.safe_load(file)
+
+@st.cache_resource
+def initialize_models():
+    """Initialize all required models and clients"""
+    config = load_config()
+    
+    # Initialize BGE model
+    tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en")
+    model = AutoModel.from_pretrained("BAAI/bge-small-en")
+    
+    # Initialize Qdrant client
+    qdrant_client = QdrantClient(
+        host=config['qdrant']['host'],
+        port=config['qdrant']['port']
+    )
+    
+    # Initialize Anthropic client
+    anthropic = Anthropic(api_key=config['anthropic']['api_key'])
+    
+    return tokenizer, model, qdrant_client, anthropic, config
+
+def generate_embeddings(text: str, tokenizer, model) -> np.ndarray:
+    """Generate embeddings for input text"""
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs).last_hidden_state.mean(dim=1)
+    return outputs.numpy().flatten()
+
+def get_vector_search_results(query_text: str, tokenizer, model, qdrant_client) -> List[Dict]:
+    """Search vector database for similar queries"""
+    query_embedding = generate_embeddings(query_text, tokenizer, model)
+    
+    results = qdrant_client.search(
+        collection_name="queries_vectorization",
+        query_vector=query_embedding.tolist(),
+        limit=3,
+        score_threshold=0.7  # Lowered threshold
+    )
+    
+    # Debug print
+    print("\nVector Search Results:")
+    for r in results:
+        print(f"\nScore: {r.score}")
+        print(f"Payload: {r.payload}")
+    
+    return results
+
+def create_dynamic_tools(vector_results: List[Dict]) -> List[Dict]:
+    """Create tool definitions dynamically based on vector search results"""
+    tools = []
+    
+    for result in vector_results:
+        payload = result.payload
+        header = payload.get('header', '')
+        description = payload.get('description', '')
+        metadata = payload.get('metadata', {})
+        tags = metadata.get('tags', [])
+        
+        tools.append({
+            "name": f"get_{header}",
+            "description": f"Get SQL query for: {description}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "should_return_query": {
+                        "type": "boolean",
+                        "description": "Whether to return the SQL query based on matching rules"
+                    },
+                    "matched_header": {
+                        "type": "string",
+                        "description": "The header of the matched query if found"
+                    }
+                },
+                "required": ["should_return_query", "matched_header"]
+            }
+        })
+    
+    return tools
+
+def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Dict]) -> Dict:
+    """Process query using semantic intent matching"""
+    # First check if query matches predefined features
+    if check_feature_match(user_query):
+        return {
+            'sql_query': None,
+            'response': "Please visit http://192.168.1.36:5007 for this feature."
+        }
+    
+    dynamic_tools = create_dynamic_tools(vector_results)
+    
+    message = anthropic.messages.create(
+        model="claude-3-sonnet-20240229",
+        max_tokens=1000,
+        temperature=0,
+        tools=dynamic_tools,
+        messages=[{
+            "role": "user",
+            "content": f"""You are a query intent analyzer. Your task is to understand the user's intent while preserving exact meaning.
+
+            User query: "{user_query}"
+            
+            Available queries metadata:
+            {[{
+                'header': result.payload.get('header'),
+                'description': result.payload.get('description'),
+                'tags': result.payload.get('tags', []),
+                'module': result.payload.get('module', '')
+            } for result in vector_results]}
+            
+            Intent Analysis:
+            1. Look at each query's description and tags to understand what information it provides
+            2. Analyze the user's query to understand what they're asking for
+            3. Check if they're requesting EXACTLY the same information, considering:
+               - Natural language variations ("what is the status of X" = "X status")
+               - Question forms ("give me X" = "X")
+               - Polite forms ("can you show me X" = "X")
+               
+            BUT, strictly reject if:
+               - They specify a state (inactive, running, failed, etc.)
+               - They add conditions or qualifiers (temp, specific, etc.)
+               - They ask for a subset or variation of the information
+               
+            Use tool calling to indicate match:
+            - should_return_query: true if semantic intent matches exactly
+            - matched_header: header of matching query
+
+            Think step by step:
+            1. What information does the stored query provide?
+            2. What information is the user asking for?
+            3. Are they exactly the same in meaning (ignoring natural language variation)?
+            4. Are there any modifiers that change the meaning?
+            """
+        }]
+    )
+
+    sql_query = None
+    response = "Please contact your system administrator."
+    
+    if hasattr(message, 'content') and isinstance(message.content, list):
+        for block in message.content:
+            if hasattr(block, 'input'):
+                should_return_query = block.input.get('should_return_query', False)
+                matched_header = block.input.get('matched_header', '')
+                
+                if should_return_query:
+                    for result in vector_results:
+                        if result.payload.get('header') == matched_header:
+                            sql_query = result.payload.get('query')
+                            module = result.payload.get('module')
+                            if module:
+                                response = f"Here is the SQL query from {module}:"
+                            else:
+                                response = "Here is the SQL query:"
+                            break
+    
+    return {
+        'sql_query': sql_query,
+        'response': response
+    }
+
+def main():
+    """Main Streamlit application"""
+    st.title("SQL Query Assistant")
+    
+    try:
+        # Initialize models and clients
+        tokenizer, model, qdrant_client, anthropic, config = initialize_models()
+        
+        # Add chat history controls in sidebar
+        st.sidebar.title("Chat History")
+        
+        # Load all chat histories first
+        chat_histories = load_chat_history()
+        
+        # Initialize session state
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+            
+        # Initialize current chat ID if not exists
+        if "current_chat_id" not in st.session_state:
+            st.session_state.current_chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Clear all history section
+        col1, col2 = st.sidebar.columns([1, 1])
+        clear_clicked = col1.button("Clear All History")
+        confirm_clear = col2.checkbox("Confirm Clear")
+        
+        if clear_clicked and confirm_clear:
+            # Clear both the file and session state
+            if os.path.exists('chat_history.pkl'):
+                os.remove('chat_history.pkl')
+            chat_histories = {}
+            st.session_state.messages = []
+            st.session_state.current_chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.rerun()
+        
+        # Create a new chat button
+        if st.sidebar.button("New Chat", key="new_chat"):
+            st.session_state.messages = []
+            st.session_state.current_chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            # Update chat histories with the new empty chat
+            chat_histories[st.session_state.current_chat_id] = {
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'messages': []
+            }
+            save_chat_history(chat_histories)
+            st.rerun()
+        
+        # Save current chat to histories if it has messages
+        if st.session_state.messages:
+            chat_histories[st.session_state.current_chat_id] = {
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'messages': st.session_state.messages
+            }
+            save_chat_history(chat_histories)
+        
+        # Create a dropdown to select previous chats with delete buttons
+        if chat_histories:
+            st.sidebar.markdown("### Previous Chats")
+            
+            # Sort chat histories by timestamp (newest first)
+            sorted_chats = sorted(
+                chat_histories.items(),
+                key=lambda x: x[1]['timestamp'],
+                reverse=True
+            )
+            
+            # Create a container for each chat history with delete button
+            for chat_id, chat_data in sorted_chats:
+                col1, col2 = st.sidebar.columns([4, 1])
+                
+                # Format the chat option display
+                chat_label = f"{chat_data['timestamp']}"
+                if chat_id == st.session_state.current_chat_id:
+                    chat_label += " (Current)"
+                
+                # Create a clickable button that looks like text for the chat
+                if col1.button(chat_label, key=f"select_{chat_id}"):
+                    if chat_id != st.session_state.current_chat_id:
+                        st.session_state.messages = chat_data['messages']
+                        st.session_state.current_chat_id = chat_id
+                        st.rerun()
+                
+                # Delete button for this chat
+                if col2.button("🗑️", key=f"delete_{chat_id}"):
+                    # If deleting current chat, switch to the newest remaining chat
+                    if chat_id == st.session_state.current_chat_id:
+                        remaining_chats = [cid for cid in chat_histories.keys() if cid != chat_id]
+                        if remaining_chats:
+                            # Find the newest remaining chat
+                            newest_chat_id = max(
+                                remaining_chats,
+                                key=lambda cid: chat_histories[cid]['timestamp']
+                            )
+                            st.session_state.current_chat_id = newest_chat_id
+                            st.session_state.messages = chat_histories[newest_chat_id]['messages']
+                        else:
+                            # No chats left, create new empty chat
+                            st.session_state.current_chat_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            st.session_state.messages = []
+                    
+                    # Delete the chat from histories
+                    del chat_histories[chat_id]
+                    save_chat_history(chat_histories)
+                    st.rerun()
+        
+        # Display current chat
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        # Handle user input
+        if prompt := st.chat_input("Ask about an SQL query"):
+            # Add user message to chat
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            # Get vector search results
+            vector_results = get_vector_search_results(prompt, tokenizer, model, qdrant_client)
+            
+            # Process query using metadata matching
+            result = process_query(anthropic, prompt, vector_results)
+            
+            # Display response
+            with st.chat_message("assistant"):
+                if result['sql_query']:
+                    st.markdown(f"```sql\n{result['sql_query']}\n```")
+                else:
+                    st.markdown(result['response'])
+                
+                # Add assistant response to chat history
+                full_response = f"{result['sql_query']}\n\n{result['response']}" if result['sql_query'] else result['response']
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                
+                # Save updated chat history
+                chat_histories[st.session_state.current_chat_id] = {
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'messages': st.session_state.messages
+                }
+                save_chat_history(chat_histories)
+                
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
