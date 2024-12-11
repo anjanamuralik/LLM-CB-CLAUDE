@@ -1,0 +1,253 @@
+import streamlit as st
+import torch
+from transformers import AutoTokenizer, AutoModel
+from qdrant_client import QdrantClient
+from anthropic import Anthropic
+import yaml
+import os
+from typing import Dict, Optional, List
+import json
+import numpy as np
+
+def load_config():
+    """Load configuration from YAML file"""
+    with open('config.yaml', 'r') as file:
+        return yaml.safe_load(file)
+
+@st.cache_resource
+def initialize_models():
+    """Initialize all required models and clients"""
+    config = load_config()
+    
+    tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en")
+    model = AutoModel.from_pretrained("BAAI/bge-small-en")
+    
+    qdrant_client = QdrantClient(
+        host=config['qdrant']['host'],
+        port=config['qdrant']['port']
+    )
+    
+    anthropic = Anthropic(api_key=config['anthropic']['api_key'])
+    
+    return tokenizer, model, qdrant_client, anthropic, config
+
+def generate_embeddings(text: str, tokenizer, model) -> np.ndarray:
+    """Generate embeddings for input text"""
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs).last_hidden_state.mean(dim=1)
+    return outputs.numpy().flatten()
+
+def get_vector_search_results(query_text: str, tokenizer, model, qdrant_client) -> List[Dict]:
+    """Search vector database for similar queries"""
+    query_embedding = generate_embeddings(query_text, tokenizer, model)
+    
+    results = qdrant_client.search(
+        collection_name="queries_vectorization",
+        query_vector=query_embedding.tolist(),
+        limit=3,
+        score_threshold=0.7
+    )
+    
+    print("\nVector Search Results:")
+    for r in results:
+        print(f"\nScore: {r.score}")
+        print(f"Payload: {r.payload}")
+    
+    return results
+
+def create_dynamic_tools(vector_results: List[Dict]) -> List[Dict]:
+    """Create tool definitions dynamically based on vector search results"""
+    tools = []
+    
+    for result in vector_results:
+        payload = result.payload
+        header = payload.get('header', '')
+        description = payload.get('description', '')
+        
+        tools.append({
+            "name": f"modify_query_{header}",
+            "description": f"Modify SQL query for: {description}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "should_modify": {
+                        "type": "boolean",
+                        "description": "Whether the base query should be modified"
+                    },
+                    "matched_header": {
+                        "type": "string",
+                        "description": "The header of the matched query"
+                    },
+                    "modifications": {
+                        "type": "object",
+                        "description": "Modifications to apply to the query",
+                        "properties": {
+                            "conditions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Additional WHERE conditions"
+                            },
+                            "filters": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Additional filter criteria"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Result limit if specified"
+                            }
+                        }
+                    }
+                },
+                "required": ["should_modify", "matched_header"]
+            }
+        })
+    
+    return tools
+
+def modify_sql_query(base_query: str, modifications: Dict) -> str:
+    """Modify the base SQL query according to the specified modifications"""
+    modified_query = base_query.strip()
+    
+    # Add WHERE conditions
+    conditions = modifications.get('conditions', [])
+    if conditions:
+        if 'WHERE' in modified_query.upper():
+            modified_query = modified_query.replace('WHERE', 'WHERE ' + ' AND '.join(conditions) + ' AND ', 1)
+        else:
+            before_group = modified_query.upper().split('GROUP BY')[0] if 'GROUP BY' in modified_query.upper() else modified_query
+            before_order = before_group.split('ORDER BY')[0] if 'ORDER BY' in before_group.upper() else before_group
+            modified_query = before_order + ' WHERE ' + ' AND '.join(conditions) + modified_query[len(before_order):]
+
+    # Add filters
+    filters = modifications.get('filters', [])
+    if filters:
+        if 'WHERE' in modified_query.upper():
+            modified_query = modified_query.replace('WHERE', 'WHERE ' + ' AND '.join(filters) + ' AND ', 1)
+        else:
+            before_group = modified_query.upper().split('GROUP BY')[0] if 'GROUP BY' in modified_query.upper() else modified_query
+            before_order = before_group.split('ORDER BY')[0] if 'ORDER BY' in before_group.upper() else before_group
+            modified_query = before_order + ' WHERE ' + ' AND '.join(filters) + modified_query[len(before_order):]
+
+    # Add LIMIT
+    limit = modifications.get('limit')
+    if limit:
+        if 'LIMIT' in modified_query.upper():
+            modified_query = modified_query.replace(modified_query[modified_query.upper().index('LIMIT'):], f'LIMIT {limit}')
+        else:
+            modified_query += f' LIMIT {limit}'
+            
+    return modified_query
+
+def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Dict]) -> Dict:
+    """Process query using semantic intent matching and modify if needed"""
+    dynamic_tools = create_dynamic_tools(vector_results)
+    
+    message = anthropic.messages.create(
+        model="claude-3-sonnet-20240229",
+        max_tokens=1000,
+        temperature=0,
+        tools=dynamic_tools,
+        messages=[{
+            "role": "user",
+            "content": f"""You are a query analyzer and modifier. Analyze the user's intent and modify queries accordingly.
+
+            User query: "{user_query}"
+            
+            Available queries metadata:
+            {[{
+                'header': result.payload.get('header'),
+                'description': result.payload.get('description'),
+                'query': result.payload.get('query'),
+                'tags': result.payload.get('tags', []),
+                'module': result.payload.get('module', '')
+            } for result in vector_results]}
+            
+            Analysis steps:
+            1. Determine if the user's query matches any available query's intent
+            2. If there's a match, identify if modifications are needed:
+               - Additional conditions or filters
+               - Result limits
+               - Specific states or qualifiers
+            3. If modifications are needed, specify them in a structured way
+            
+            Use tool calling to indicate match and modifications:
+            - should_modify: true if there's a match and modifications needed
+            - matched_header: header of matching query
+            - modifications: specific changes needed (conditions, filters, limit)
+
+            Think step by step:
+            1. Is there a matching base query?
+            2. What modifications are needed?
+            3. How should the modifications be structured?
+            """
+        }]
+    )
+
+    sql_query = None
+    response = "Please contact your system administrator."
+    
+    if hasattr(message, 'content') and isinstance(message.content, list):
+        for block in message.content:
+            if hasattr(block, 'input'):
+                should_modify = block.input.get('should_modify', False)
+                matched_header = block.input.get('matched_header', '')
+                modifications = block.input.get('modifications', {})
+                
+                if should_modify:
+                    for result in vector_results:
+                        if result.payload.get('header') == matched_header:
+                            base_query = result.payload.get('query')
+                            module = result.payload.get('module')
+                            
+                            # Modify the query according to specifications
+                            sql_query = modify_sql_query(base_query, modifications)
+                            
+                            if module:
+                                response = f"Here is the modified SQL query from {module}:"
+                            else:
+                                response = "Here is the modified SQL query:"
+                            break
+    
+    return {
+        'sql_query': sql_query,
+        'response': response
+    }
+
+def main():
+    """Main Streamlit application"""
+    st.title("SQL Query Assistant")
+    
+    try:
+        tokenizer, model, qdrant_client, anthropic, config = initialize_models()
+        
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        if prompt := st.chat_input("Ask about an SQL query"):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            vector_results = get_vector_search_results(prompt, tokenizer, model, qdrant_client)
+            result = process_query(anthropic, prompt, vector_results)
+            
+            with st.chat_message("assistant"):
+                if result['sql_query']:
+                    st.markdown(f"```sql\n{result['sql_query']}\n```")
+                else:
+                    st.markdown(result['response'])
+                
+                full_response = f"{result['sql_query']}\n\n{result['response']}" if result['sql_query'] else result['response']
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
