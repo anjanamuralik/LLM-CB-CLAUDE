@@ -1,0 +1,83 @@
+[
+    {
+        "header": "tablespace_usage",
+        "description": "Query to get tablespace usage details",
+        "query": "SELECT tablespace_name, ROUND(total_space_mb, 2) AS total_space_mb, ROUND(free_space_mb, 2) AS free_space_mb, ROUND(max_free_space_mb, 2) AS max_free_space_mb, ROUND((free_space_mb / total_space_mb) * 100, 2) AS free_space_percent FROM ( SELECT tablespace_name, SUM(bytes) / 1024 / 1024 AS total_space_mb, SUM(DECODE(autoextensible, 'YES', maxbytes, bytes)) / 1024 / 1024 AS max_free_space_mb, SUM(DECODE(autoextensible, 'YES', maxbytes, bytes) - bytes) / 1024 / 1024 AS free_space_mb FROM dba_data_files GROUP BY tablespace_name);",
+        "metadata": {
+            "module": "DB Monitoring",
+            "tags": ["tablespace", "usage", "monitoring"]
+        }
+    },
+    {
+        "header": "blocking_sessions",
+        "description": "Query to find blocking sessions in the database",
+        "query": "SELECT s1.username || '@' || s1.machine || ' ( SID=' || s1.sid || ' ) is blocking ' || s2.username || '@' || s2.machine || ' ( SID=' || s2.sid || ' ) ' AS blocking_status FROM v$lock l1 JOIN v$session s1 ON s1.sid = l1.sid JOIN v$lock l2 ON l1.id1 = l2.id1 AND l1.id2 = l2.id2 JOIN v$session s2 ON s2.sid = l2.sid WHERE l1.BLOCK = 1 AND l2.request > 0;",
+        "metadata": {
+            "module": "Session Monitoring",
+            "tags": ["blocking", "sessions", "monitoring"]
+        }
+    },
+    {
+        "header": "concurrent_manager_status",
+        "description": "Query to check concurrent manager status",
+        "query": "SELECT user_concurrent_queue_name AS concurrent_manager_name, target_node AS manager_node, DECODE(max_processes - running_processes, 0, 'Manager Active', 'Manager Inactive') AS status FROM apps.fnd_concurrent_queues_vl WHERE max_processes <> 0;",
+        "metadata": {
+            "module": "EBS Monitoring",
+            "tags": ["concurrent", "manager", "status"]
+        }
+    },
+    {
+        "header": "long_running_concurrent_programs",
+        "description": "Query to identify long-running concurrent programs",
+        "query": "SELECT sid, serial#, username, opname AS OPERATION, target AS OBJECT, TRUNC(elapsed_seconds, 5) AS \"ET (s)\", TO_CHAR(start_time, 'HH24:MI:SS') AS start_time, ROUND((sofar / totalwork) * 100, 2) AS \"COMPLETE (%)\" FROM v$session_longops WHERE username NOT IN ('SYS', 'SYSTEM') AND totalwork > 0 ORDER BY elapsed_seconds;",
+        "metadata": {
+            "module": "Performance Monitoring",
+            "tags": ["long-running", "concurrent", "programs"]
+        }
+    },
+    {
+        "header": "workflow_mailer_status",
+        "description": "Query to get the status of workflow mailer services",
+        "query": "SELECT fcq.USER_CONCURRENT_QUEUE_NAME Container_Name, DECODE(fcp.OS_PROCESS_ID, NULL, 'Not Running', fcp.OS_PROCESS_ID) PROCID, fcq.ENABLED_FLAG ENABLED, fsc.COMPONENT_NAME, fsc.STARTUP_MODE, fsc.COMPONENT_STATUS FROM APPS.FND_CONCURRENT_QUEUES_VL fcq, APPS.FND_CP_SERVICES fcs, APPS.FND_CONCURRENT_PROCESSES fcp, fnd_svc_components fsc WHERE fcq.MANAGER_TYPE = fcs.SERVICE_ID AND fcs.SERVICE_HANDLE = 'FNDCPGSC' AND fsc.concurrent_queue_id = fcq.concurrent_queue_id(+) AND fcq.concurrent_queue_id = fcp.concurrent_queue_id(+) AND fcq.application_id = fcp.queue_application_id(+) AND fcp.process_status_code(+) = 'A' ORDER BY fcp.OS_PROCESS_ID, fsc.STARTUP_MODE;",
+        "metadata": {
+            "module": "EBS Monitoring",
+            "tags": ["workflow", "mailer", "status"]
+        }
+    },
+    {
+        "header": "concurrent_manager",
+        "description": "Query to get concurrent manager details",
+        "query": "SELECT DISTINCT b.user_concurrent_queue_name \"Concurrent Manager\", a.running_processes \"ACTUAL Processes\", a.max_processes \"TARGET Processes\", DECODE(b.control_code, 'D', 'Deactivating', 'E', 'Deactivated', 'N', 'Node unavailable', 'A', 'Activating', 'X', 'Terminated', 'T', 'Terminating', 'V', 'Verifying', 'O', 'Suspending', 'P', 'Suspended', 'Q', 'Resuming', 'R', 'Restarting', 'Running') status FROM apps.fnd_concurrent_queues a, apps.fnd_concurrent_queues_vl b WHERE a.concurrent_queue_id = b.concurrent_queue_id AND a.max_processes != 0 ORDER BY a.max_processes DESC;",
+        "metadata": {
+            "module": "EBS Monitoring",
+            "tags": ["concurrent", "manager", "details"]
+        }
+    },
+    {
+        "header": "instance_information",
+        "description": "Query to retrieve instance information",
+        "query": "SELECT instance_name, host_name, version, startup_time, status FROM v$instance;",
+        "metadata": {
+            "module": "DB Information",
+            "tags": ["instance", "information", "monitoring"]
+        }
+    },
+    {
+        "header": "database_information",
+        "description": "Query to retrieve database information",
+        "query": "SELECT name, created, log_mode, open_mode, database_role FROM v$database;",
+        "metadata": {
+            "module": "DB Information",
+            "tags": ["database", "information", "monitoring"]
+        }
+    },
+    {
+        "header": "add_responsibility",
+        "description": "Query to add a responsibility to a user",
+        "query": "DECLARE v_user_name VARCHAR2(20) := :username_1; v_req_resp_key VARCHAR2(50) := :responsibility_key_1; v_description VARCHAR2(100); v_req_resp_name VARCHAR2(200); v_appl_shrt_name VARCHAR2(20); v_appl_name VARCHAR2(50); BEGIN SELECT fav.application_short_name, fav.application_name, frv.responsibility_name INTO v_appl_shrt_name, v_appl_name, v_req_resp_name FROM fnd_application_vl fav JOIN fnd_responsibility_vl frv ON frv.application_id = fav.application_id WHERE frv.responsibility_key = v_req_resp_key; fnd_user_pkg.addresp(username => v_user_name, resp_app => v_appl_shrt_name, resp_key => v_req_resp_key, security_group => 'STANDARD', description => v_description, start_date => SYSDATE, end_date => SYSDATE); COMMIT; DBMS_OUTPUT.put_line('Responsibility is added to the user ' || v_user_name); EXCEPTION WHEN OTHERS THEN DBMS_OUTPUT.put_line('Error: ' || SQLCODE || '; ' || SUBSTR(SQLERRM, 1, 250)); END;",
+        "metadata": {
+            "module": "User Management",
+            "tags": ["responsibility", "add", "user"]
+        }
+    }
+]
