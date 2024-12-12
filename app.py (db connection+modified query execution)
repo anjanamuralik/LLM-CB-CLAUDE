@@ -1,0 +1,419 @@
+import streamlit as st
+import torch
+from transformers import AutoTokenizer, AutoModel
+from qdrant_client import QdrantClient
+from anthropic import Anthropic
+import yaml
+import os
+from typing import Dict, Optional, List
+import json
+import numpy as np
+import cx_Oracle
+
+def format_sql_query(query: str) -> str:
+    """Format SQL query by removing semicolons and extra whitespace"""
+    # Remove trailing semicolon if present
+    formatted_query = query.strip()
+    if formatted_query.endswith(';'):
+        formatted_query = formatted_query[:-1]
+    
+    # Remove extra whitespace
+    formatted_query = ' '.join(formatted_query.split())
+    
+    return formatted_query
+
+def get_database_connection(database_name: str, config: Dict) -> Optional[cx_Oracle.Connection]:
+    """
+    Create Oracle database connection with error handling
+    Returns None if connection fails
+    """
+    try:
+        # Get database configuration
+        db_config = config['databases'][database_name]
+        username = db_config['username']
+        password = db_config['password']
+        host = db_config['host']
+        port = db_config['port']
+        service_name = db_config['service_name']
+        
+        # Create DSN
+        dsn = cx_Oracle.makedsn(host, port, service_name=service_name)
+        
+        # Create connection
+        conn = cx_Oracle.connect(
+            user=username,
+            password=password,
+            dsn=dsn
+        )
+        
+        return conn
+    except cx_Oracle.Error as e:
+        error_obj, = e.args
+        st.sidebar.error(f"Database connection error: {error_obj.message}")
+        return None
+    except KeyError as e:
+        st.sidebar.error(f"Database configuration not found for {database_name}")
+        return None
+    except Exception as e:
+        st.sidebar.error(f"Connection error: {str(e)}")
+        return None
+
+
+
+def execute_query(query: str, database_name: str, config: Dict) -> List[Dict]:
+    """Execute SQL query on selected Oracle database and return results"""
+    conn = get_database_connection(database_name, config)
+    if not conn:
+        return []
+        
+    try:
+        cursor = conn.cursor()
+        
+        # Format the query before execution
+        formatted_query = format_sql_query(query)
+        
+        # Log the formatted query for debugging
+        st.code(f"Executing query:\n{formatted_query}", language="sql")
+        
+        cursor.execute(formatted_query)
+        
+        # Get column names
+        columns = [col[0] for col in cursor.description]
+        
+        # Fetch results and convert to list of dictionaries
+        results = []
+        for row in cursor.fetchall():
+            # Convert any cx_Oracle.LOB objects to strings
+            processed_row = []
+            for item in row:
+                if isinstance(item, cx_Oracle.LOB):
+                    processed_row.append(item.read())
+                else:
+                    processed_row.append(item)
+            results.append(dict(zip(columns, processed_row)))
+            
+        cursor.close()
+        return results
+    except cx_Oracle.Error as e:
+        error_obj, = e.args
+        st.error(f"Query execution error: {error_obj.message}")
+        st.error("Make sure you have the necessary privileges to execute this query.")
+        return []
+    except Exception as e:
+        st.error(f"Error executing query: {str(e)}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def load_config():
+    """Load configuration from YAML file"""
+    with open('config.yaml', 'r') as file:
+        return yaml.safe_load(file)
+
+@st.cache_resource
+def initialize_models():
+    """Initialize all required models and clients"""
+    config = load_config()
+    
+    tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-small-en")
+    model = AutoModel.from_pretrained("BAAI/bge-small-en")
+    
+    qdrant_client = QdrantClient(
+        host=config['qdrant']['host'],
+        port=config['qdrant']['port']
+    )
+    
+    anthropic = Anthropic(api_key=config['anthropic']['api_key'])
+    
+    return tokenizer, model, qdrant_client, anthropic, config
+
+
+def generate_embeddings(text: str, tokenizer, model) -> np.ndarray:
+    """Generate embeddings for input text"""
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    with torch.no_grad():
+        outputs = model(**inputs).last_hidden_state.mean(dim=1)
+    return outputs.numpy().flatten()
+
+def get_vector_search_results(query_text: str, tokenizer, model, qdrant_client) -> List[Dict]:
+    """Search vector database for similar queries"""
+    query_embedding = generate_embeddings(query_text, tokenizer, model)
+    
+    results = qdrant_client.search(
+        collection_name="queries_vectorization",
+        query_vector=query_embedding.tolist(),
+        limit=3,
+        score_threshold=0.7
+    )
+    
+    print("\nVector Search Results:")
+    for r in results:
+        print(f"\nScore: {r.score}")
+        print(f"Payload: {r.payload}")
+    
+    return results
+
+def create_dynamic_tools(vector_results: List[Dict]) -> List[Dict]:
+    """Create tool definitions dynamically based on vector search results"""
+    tools = []
+    
+    for result in vector_results:
+        payload = result.payload
+        header = payload.get('header', '')
+        description = payload.get('description', '')
+        
+        tools.append({
+            "name": f"modify_query_{header}",
+            "description": f"Modify SQL query for: {description}",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "should_modify": {
+                        "type": "boolean",
+                        "description": "Whether the base query should be modified"
+                    },
+                    "matched_header": {
+                        "type": "string",
+                        "description": "The header of the matched query"
+                    },
+                    "modifications": {
+                        "type": "object",
+                        "description": "Modifications to apply to the query",
+                        "properties": {
+                            "conditions": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Additional WHERE conditions"
+                            },
+                            "filters": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "Additional filter criteria"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Result limit if specified"
+                            }
+                        }
+                    }
+                },
+                "required": ["should_modify", "matched_header"]
+            }
+        })
+    
+    return tools
+
+def modify_sql_query(base_query: str, modifications: Dict) -> str:
+    """
+    Modify SQL query with a simple approach that fixes common issues.
+    
+    Args:
+        base_query (str): Original SQL query
+        modifications (Dict): Modifications to apply
+            - conditions (List[str]): Additional WHERE conditions
+            - filters (List[str]): Additional filter criteria
+            - limit (int): Result limit
+    """
+    # Clean up the query
+    query = base_query.strip()
+    if query.endswith(';'):
+        query = query[:-1]
+
+    # Fix duplicate WHERE keyword
+    if 'WHERE WHERE' in query.upper():
+        query = query.upper().replace('WHERE WHERE', 'WHERE')
+        
+    # Add conditions and filters
+    conditions = modifications.get('conditions', [])
+    filters = modifications.get('filters', [])
+    
+    if conditions or filters:
+        all_conditions = ' AND '.join(conditions + filters)
+        if 'WHERE' in query.upper():
+            # Add to existing WHERE clause
+            where_index = query.upper().find('WHERE')
+            # Find the end of the WHERE clause
+            remaining = query[where_index + 5:]  # len('WHERE') = 5
+            # Check for other clauses
+            next_clause_index = float('inf')
+            for clause in ['GROUP BY', 'ORDER BY', 'LIMIT']:
+                clause_pos = remaining.upper().find(clause)
+                if clause_pos != -1:
+                    next_clause_index = min(next_clause_index, clause_pos)
+                    
+            if next_clause_index != float('inf'):
+                # Insert conditions before the next clause
+                query = (query[:where_index + 5] + ' ' + 
+                        remaining[:next_clause_index].strip() + 
+                        ' AND ' + all_conditions + ' ' + 
+                        remaining[next_clause_index:])
+            else:
+                # No other clauses, just append conditions
+                query = query[:where_index + 5] + ' ' + remaining.strip() + ' AND ' + all_conditions
+        else:
+            # Add new WHERE clause before any GROUP BY, ORDER BY, or LIMIT
+            for clause in ['GROUP BY', 'ORDER BY', 'LIMIT']:
+                clause_index = query.upper().find(clause)
+                if clause_index != -1:
+                    query = query[:clause_index] + ' WHERE ' + all_conditions + ' ' + query[clause_index:]
+                    break
+            else:
+                # No other clauses found, append WHERE
+                query += ' WHERE ' + all_conditions
+
+    # Handle LIMIT
+    limit = modifications.get('limit')
+    if limit is not None:
+        if 'LIMIT' in query.upper():
+            # Replace existing LIMIT
+            limit_index = query.upper().find('LIMIT')
+            query = query[:limit_index] + f'LIMIT {limit}'
+        else:
+            # Add new LIMIT
+            query += f' LIMIT {limit}'
+
+    return query + ';'
+
+def process_query(anthropic: Anthropic, user_query: str, vector_results: List[Dict]) -> Dict:
+    """Process query using semantic intent matching and modify if needed"""
+    dynamic_tools = create_dynamic_tools(vector_results)
+    
+    message = anthropic.messages.create(
+        model="claude-3-sonnet-20240229",
+        max_tokens=1000,
+        temperature=0,
+        tools=dynamic_tools,
+        messages=[{
+            "role": "user",
+            "content": f"""You are a query analyzer and modifier. Analyze the user's intent and modify queries accordingly.
+
+            User query: "{user_query}"
+            
+            Available queries metadata:
+            {[{
+                'header': result.payload.get('header'),
+                'description': result.payload.get('description'),
+                'query': result.payload.get('query'),
+                'tags': result.payload.get('tags', []),
+                'module': result.payload.get('module', '')
+            } for result in vector_results]}
+            
+            Analysis steps:
+            1. Determine if the user's query matches any available query's intent
+            2. If there's a match, identify if modifications are needed:
+               - Additional conditions or filters
+               - Result limits
+               - Specific states or qualifiers
+            3. If modifications are needed, specify them in a structured way
+            
+            Use tool calling to indicate match and modifications:
+            - should_modify: true if there's a match and modifications needed
+            - matched_header: header of matching query
+            - modifications: specific changes needed (conditions, filters, limit)
+
+            Think step by step:
+            1. Is there a matching base query?
+            2. What modifications are needed?
+            3. How should the modifications be structured?
+            """
+        }]
+    )
+
+    sql_query = None
+    response = "Please contact your system administrator."
+    
+    if hasattr(message, 'content') and isinstance(message.content, list):
+        for block in message.content:
+            if hasattr(block, 'input'):
+                should_modify = block.input.get('should_modify', False)
+                matched_header = block.input.get('matched_header', '')
+                modifications = block.input.get('modifications', {})
+                
+                if should_modify:
+                    for result in vector_results:
+                        if result.payload.get('header') == matched_header:
+                            base_query = result.payload.get('query')
+                            module = result.payload.get('module')
+                            
+                            # Modify the query according to specifications
+                            sql_query = modify_sql_query(base_query, modifications)
+                            
+                            if module:
+                                response = f"Here is the modified SQL query from {module}:"
+                            else:
+                                response = "Here is the modified SQL query:"
+                            break
+    
+    return {
+        'sql_query': sql_query,
+        'response': response
+    }
+
+
+def main():
+    """Main Streamlit application"""
+    # Configure the sidebar
+    st.sidebar.title("Database Configuration")
+    available_databases = ["R26", "R13", "TEST", "DEMO"]
+    selected_database = st.sidebar.selectbox(
+        "Select Database",
+        available_databases,
+        index=0
+    )
+    
+    # Test connection button
+    if st.sidebar.button("Test Connection"):
+        config = load_config()
+        conn = get_database_connection(selected_database, config)
+        if conn:
+            st.sidebar.success(f"Successfully connected to {selected_database}")
+            conn.close()
+    
+    # Main content area
+    st.title("SQL Query Assistant")
+    
+    try:
+        tokenizer, model, qdrant_client, anthropic, config = initialize_models()
+        
+        if "messages" not in st.session_state:
+            st.session_state.messages = []
+        
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+        
+        if prompt := st.chat_input("Ask about an SQL query"):
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            
+            vector_results = get_vector_search_results(prompt, tokenizer, model, qdrant_client)
+            result = process_query(anthropic, prompt, vector_results)
+            
+            with st.chat_message("assistant"):
+                if result['sql_query']:
+                    query_col, db_col = st.columns([3, 1])
+                    
+                    with query_col:
+                        st.markdown(f"```sql\n{result['sql_query']}\n```")
+                    
+                    with db_col:
+                        st.info(f"Executing on: {selected_database}")
+                    
+                    # Execute query and display results
+                    query_results = execute_query(result['sql_query'], selected_database, config)
+                    if query_results:
+                        st.write("Query Results:")
+                        st.dataframe(query_results)
+                else:
+                    st.markdown(result['response'])
+                
+                full_response = f"Database: {selected_database}\n\n{result['sql_query']}\n\n{result['response']}" if result['sql_query'] else result['response']
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                
+    except Exception as e:
+        st.error(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    main()
