@@ -1,0 +1,32 @@
+anthropic:
+  api_key: "sk-ant-api04-I_9bq7aJEFHhdfYJZtV3c_IwtcQf6YqeXeW7EjDCAST_5lvHChzeImNqudOs5n4j8XiOujGpOfU5Q6_jvIr_lA-cBom6QAA"
+
+qdrant:
+  host: "localhost"
+  port: 6333
+
+databases:
+  R26:
+    username: "apps"
+    password: "apps"
+    host: "r26.gapblue.com"
+    port: 1521  # Default Oracle port
+    service_name: "VIS"
+  R13:
+    username: "apps"
+    password: "apps"
+    host: "r13.gapblue.com"
+    port: 1521
+    service_name: "VIS"
+  TEST:
+    username: "apps"
+    password: "apps"
+    host: "testapp.gapblue.com"
+    port: 1531
+    service_name: "TEST"
+  DEMO:
+    username: "your_username"
+    password: "your_password"
+    host: "your_oracle_host"
+    port: 1521
+    service_name: "your_service_name"
