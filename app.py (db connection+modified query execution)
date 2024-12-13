@@ -75,6 +75,7 @@ def execute_query(query: str, database_name: str, config: Dict) -> List[Dict]:
         # Log the formatted query for debugging
         st.code(f"Executing query:\n{formatted_query}", language="sql")
         
+        # Execute the query
         cursor.execute(formatted_query)
         
         # Get column names
@@ -83,7 +84,6 @@ def execute_query(query: str, database_name: str, config: Dict) -> List[Dict]:
         # Fetch results and convert to list of dictionaries
         results = []
         for row in cursor.fetchall():
-            # Convert any cx_Oracle.LOB objects to strings
             processed_row = []
             for item in row:
                 if isinstance(item, cx_Oracle.LOB):
@@ -91,6 +91,12 @@ def execute_query(query: str, database_name: str, config: Dict) -> List[Dict]:
                 else:
                     processed_row.append(item)
             results.append(dict(zip(columns, processed_row)))
+            
+        # Show message when no rows are returned
+        if not results:
+            st.info("Query executed successfully, but no rows were selected.")
+            # Return empty list but with column structure
+            return [dict.fromkeys(columns, None)]
             
         cursor.close()
         return results
@@ -403,9 +409,15 @@ def main():
                     
                     # Execute query and display results
                     query_results = execute_query(result['sql_query'], selected_database, config)
-                    if query_results:
-                        st.write("Query Results:")
+                    
+                    # Always show the results section
+                    st.write("Query Results:")
+                    if query_results and all(all(v is None for v in result.values()) for result in query_results):
+                        st.warning("No data found matching the query criteria.")
+                    elif query_results:
                         st.dataframe(query_results)
+                    else:
+                        st.error("Query execution failed or returned no results.")
                 else:
                     st.markdown(result['response'])
                 
