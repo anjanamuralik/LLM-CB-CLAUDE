@@ -6,7 +6,6 @@ from anthropic import Anthropic
 import yaml
 import os
 from typing import Dict, Optional, List
-import json
 import numpy as np
 import cx_Oracle
 
